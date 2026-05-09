@@ -116,7 +116,7 @@ canvas{display:block}
   <p>Three rounds. One minute apiece. Drop your opponent or win on damage. Now in glorious 3D — third-person, two-arm combat.</p>
   <button class="btn" id="btn-fight">FIGHT</button>
   <div class="controls">
-    <div><b>Move:</b> <span>W</span><span>A</span><span>S</span><span>D</span> &nbsp; <b>Block:</b> <span>SPACE</span></div>
+    <div><b>Move:</b> <span>W</span><span>A</span><span>S</span><span>D</span> &nbsp; <b>Block:</b> <span>SPACE</span> &nbsp; <b>Dodge:</b> <span>Q</span></div>
     <div><b>Jab:</b><span>J</span> <b>Cross:</b><span>K</span> <b>Hook:</b><span>U</span> <b>Uppercut:</b><span>I</span> <b>Overhand:</b><span>O</span></div>
     <div><b>Body:</b><span>B</span> <b>Liver:</b><span>V</span> <b>Straight:</b><span>Y</span> <b>Check Hook:</b><span>H</span></div>
     <div><b>Shovel:</b><span>G</span> <b>Corkscrew:</b><span>C</span> <b>Haymaker:</b><span>X</span></div>
@@ -452,20 +452,26 @@ function createBoxer3D(opts){
     const knee = new THREE.Mesh(new THREE.SphereGeometry(0.105, 8, 6), skinMat);
     knee.position.y = -0.51;
     grp.add(knee);
+    // Knee pivot group — lower leg rotates around this joint
+    const kneeGroup = new THREE.Group();
+    kneeGroup.position.y = -0.51;
+    grp.add(kneeGroup);
     const calf = new THREE.Mesh(new THREE.CylinderGeometry(0.105, 0.085, 0.32, 10), skinMat);
-    calf.position.y = -0.68;
-    grp.add(calf);
+    calf.position.y = -0.17;   // relative to kneeGroup
+    kneeGroup.add(calf);
     const boot = new THREE.Mesh(new THREE.BoxGeometry(0.20, 0.12, 0.32), bootMat);
-    boot.position.set(0.04, -0.88, 0);
-    grp.add(boot);
+    boot.position.set(0.04, -0.37, 0);  // relative to kneeGroup
+    kneeGroup.add(boot);
     const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.21, 0.02, 0.33), beltMat);
-    stripe.position.set(0.04, -0.84, 0);
-    grp.add(stripe);
+    stripe.position.set(0.04, -0.33, 0); // relative to kneeGroup
+    kneeGroup.add(stripe);
     root.add(grp);
-    return grp;
+    return { grp, kneeGroup };
   }
-  const legL = buildLeg(-1);
-  const legR = buildLeg(+1);
+  const legLData = buildLeg(-1);
+  const legRData = buildLeg(+1);
+  const legL = legLData.grp;
+  const legR = legRData.grp;
 
   // ═══ HIPS ═══
   const hipsGroup = new THREE.Group();
@@ -678,6 +684,8 @@ function createBoxer3D(opts){
   return {
     root, torso, headGroup, neck, chest,
     armL, armR, legL, legR,
+    legLKnee: legLData.kneeGroup,
+    legRKnee: legRData.kneeGroup,
     setGuardPose,
     stunGroup, stars,
   };
@@ -729,6 +737,9 @@ function makeBoxer(opts){
     circleTimer: 1.5 + Math.random() * 1.5,
     stunned: false, stunT: 0,
     koStaggered: false,
+    legPhase: 0,      // 0-1 walking cycle
+    kneesBent: 0,     // 0=straight 1=fully crouched
+    dodgeCooldown: 0, // seconds until next dodge allowed
     nextSide: { jab:'lead', cross:'rear', hook:'lead', uppercut:'rear', overhand:'rear',
                 bodyShot:'lead', liverShot:'lead', straight:'rear', checkHook:'lead',
                 shovelHook:'lead', corkscrew:'rear', haymaker:'rear' },
@@ -890,6 +901,16 @@ function startAction(b, kind, sideOverride){
 }
 function endAction(b){ b.action = 'idle'; b.actionT = 0; b.actionKind = null; }
 
+function startDodge(b){
+  if (b.hp <= 0 || b.action === 'ko') return;
+  if (b.dodgeCooldown > 0) return;
+  if (b.action !== 'idle') return;
+  b.action = 'dodge';
+  b.actionT = 0;
+  b.actionDur = 0.38;
+  b.dodgeCooldown = 0.9;
+}
+
 function zoneForHit(attacker, kind){
   const p = PUNCH[kind];
   if (p.zone !== 'RIBS') return p.zone;
@@ -914,6 +935,16 @@ function takeHit(target, source, kind){
   const p = PUNCH[kind];
   const zone = zoneForHit(source, kind);
   const blocked = (target.action === 'block');
+
+  // Dodge check — crouching slips jabs/hooks/most punches; uppercut punishes
+  if (!blocked && target.kneesBent > 0.5 && target.action === 'dodge'){
+    if (kind !== 'uppercut'){
+      spawnHitText('DODGE!', target, '#44ff88');
+      return;
+    }
+    spawnHitText('CAUGHT!', target, '#ff8800');
+  }
+
   let dmg = p.dmg;
   // Check-hook bonus when hitting a target mid-windup
   if (kind === 'checkHook' && target.actionKind && target.action in PUNCH){
@@ -1030,17 +1061,27 @@ function tickPlayer(b, dt){
   }
   clampToRing(b);
 
+  // Leg phase advances when moving
+  if (b.action !== 'ko' && (fIn !== 0 || sIn !== 0)){
+    b.legPhase = (b.legPhase + dt * 3.8) % 1;
+  }
+
   if (b.action === 'block' && !keys[' ']) endAction(b);
 
   if ((b.action === 'idle' || b.action === 'block') && !b.stunned){
     if (keys[' ']){
       if (b.action !== 'block') startAction(b, 'block');
     } else {
-      // Edge-triggered punches so a held key only fires once.
-      for (const k of PUNCH_KEYS){
-        if (consumeEdge(k)){
-          startAction(b, KEY_PUNCH[k]);
-          break;
+      // Dodge (edge-triggered so a held key fires once)
+      if (b.action === 'idle' && consumeEdge('q')) {
+        startDodge(b);
+      } else {
+        // Edge-triggered punches so a held key only fires once.
+        for (const k of PUNCH_KEYS){
+          if (consumeEdge(k)){
+            startAction(b, KEY_PUNCH[k]);
+            break;
+          }
         }
       }
     }
@@ -1052,10 +1093,15 @@ function tickPlayer(b, dt){
 }
 
 function tickAction(b, dt){
+  // Always-running timers
+  if (b.dodgeCooldown > 0) b.dodgeCooldown = Math.max(0, b.dodgeCooldown - dt);
+  if (b.action !== 'dodge') b.kneesBent = Math.max(0, b.kneesBent - dt * 6);
+  if (b.flinch > 0) b.flinch = Math.max(0, b.flinch - dt);
+
   // Stun timer
   if (b.stunned){
     b.stunT -= dt;
-    b.stamina = Math.max(0, b.stamina - 4 * dt); // double drain (idle drain ~0; this models extra taxation)
+    b.stamina = Math.max(0, b.stamina - 4 * dt);
     if (b.stunT <= 0){ b.stunned = false; b.stunT = 0; }
   }
 
@@ -1069,6 +1115,12 @@ function tickAction(b, dt){
     b.stamina = Math.max(0, b.stamina - 4 * dt);
     return;
   }
+  if (b.action === 'dodge'){
+    b.actionT += dt;
+    b.kneesBent = Math.sin((b.actionT / b.actionDur) * Math.PI);
+    if (b.actionT >= b.actionDur){ b.kneesBent = 0; endAction(b); }
+    return;
+  }
   if (b.action in PUNCH){
     b.actionT += dt;
     if (b.actionT >= b.actionDur) endAction(b);
@@ -1077,7 +1129,6 @@ function tickAction(b, dt){
     const regen = b.stunned ? 6 : 18;
     b.stamina = Math.min(b.maxStam, b.stamina + regen * dt);
   }
-  if (b.flinch > 0) b.flinch = Math.max(0, b.flinch - dt);
   // Track low-stamina ticks for corner advice
   if (b.stamina < 30) b.lowStaminaTicks += dt;
 }
@@ -1100,7 +1151,8 @@ function tickCpu(c, dt){
     (player.action === 'hook' || player.action === 'uppercut' || player.action === 'haymaker' || player.action === 'overhand')
     && player.actionT < (PUNCH[player.action]?.windup || 0);
   if (playerThreatening && dist < 1.7 && Math.random() < c.aiReaction * dt * 60){
-    if (c.action === 'idle') startAction(c, 'block');
+    if (c.dodgeCooldown <= 0 && Math.random() < 0.38) startDodge(c);
+    else if (c.action === 'idle') startAction(c, 'block');
   } else if (c.action === 'block' && (!playerThreatening || dist > 2.0)){
     endAction(c);
   }
@@ -1143,6 +1195,10 @@ function tickCpu(c, dt){
     c.pos.x += (fIn * fwdX + sIn * rgtX) * speed * dt;
     c.pos.z += (fIn * fwdZ + sIn * rgtZ) * speed * dt;
     clampToRing(c);
+    // CPU leg phase
+    if ((fIn !== 0 || sIn !== 0) && c.action !== 'ko'){
+      c.legPhase = (c.legPhase + dt * 3.8) % 1;
+    }
   }
   tickAction(c, dt);
 }
@@ -1178,7 +1234,7 @@ function animateBoxer(b, dt){
     r.root.position.y = -t * 0.15;
   } else {
     r.root.rotation.x = 0;
-    r.root.position.y = 0;
+    r.root.position.y = -b.kneesBent * 0.18; // crouch down during dodge
   }
 
   // Idle breathing & weight shift
@@ -1232,6 +1288,27 @@ function animateBoxer(b, dt){
   }
   r.legL.rotation.y = hipTwist * 0.6;
   r.legR.rotation.y = hipTwist * 0.6;
+
+  // ── Stepping animation ──
+  // Leg groups pivot at the hip; rotation.z swings the whole leg forward/backward.
+  const isMoving = b.action !== 'ko' && (
+    b.isPlayer
+      ? (keys['w'] || keys['a'] || keys['s'] || keys['d'])
+      : (b.aiState === 'advance' || b.aiState === 'retreat' || b.aiState === 'circle')
+  );
+  if (isMoving){
+    r.legL.rotation.z = Math.sin(b.legPhase * Math.PI * 2) * 0.30;
+    r.legR.rotation.z = Math.sin(b.legPhase * Math.PI * 2 + Math.PI) * 0.30;
+  } else {
+    r.legL.rotation.z = (r.legL.rotation.z || 0) * (1 - Math.min(1, dt * 12));
+    r.legR.rotation.z = (r.legR.rotation.z || 0) * (1 - Math.min(1, dt * 12));
+  }
+
+  // ── Knee bend (dodge / crouch) ──
+  // kneeGroup.rotation.z = negative angle bends lower leg backward = crouch.
+  const kneeBend = -b.kneesBent * 0.92;
+  if (r.legLKnee) r.legLKnee.rotation.z = kneeBend;
+  if (r.legRKnee) r.legRKnee.rotation.z = kneeBend;
 
   // Head tracking — subtle look toward opponent
   const opp = b.isPlayer ? cpu : player;
