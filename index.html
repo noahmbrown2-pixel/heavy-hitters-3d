@@ -1756,7 +1756,12 @@ function roundEnd(){
   } else {
     showInterlude(() => {
       round++;
+      const prevPlayerHp = player.hp;
+      const prevCpuHp    = cpu.hp;
       setupRound(false);
+      // Corner recovery: restore only 15% of max HP
+      player.hp = Math.min(player.maxHp, prevPlayerHp + player.maxHp * 0.15);
+      cpu.hp    = Math.min(cpu.maxHp,    prevCpuHp    + cpu.maxHp    * 0.15);
       state = 'fight';
       playBell();
     });
